@@ -36,6 +36,16 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         label: String,
         args: Array<out String>
     ): Boolean {
+        if (args.size == 1 && args[0].equals("reload", ignoreCase = true)) {
+            if (!sender.hasPermission(PERMISSION_RELOAD)) {
+                sender.sendMessage("§cУ вас нет прав на перезагрузку конфига.")
+                return true
+            }
+            plugin.reloadConfig()
+            sender.sendMessage("§aКонфиг SearchItems успешно перезагружен.")
+            return true
+        }
+
         if (!sender.hasPermission(PERMISSION_USE)) {
             sender.sendMessage("§cУ вас нет прав на эту команду.")
             return true
@@ -90,10 +100,14 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         alias: String,
         args: Array<out String>
     ): List<String> {
-        if (!sender.hasPermission(PERMISSION_USE)) return emptyList()
+        if (!sender.hasPermission(PERMISSION_USE) && !sender.hasPermission(PERMISSION_RELOAD)) return emptyList()
 
         if (args.size == 1) {
-            val suggestions = listOf("16", "32", "64", "128", "256")
+            val suggestions = ArrayList<String>(6)
+            if (sender.hasPermission(PERMISSION_RELOAD)) {
+                suggestions.add("reload")
+            }
+            suggestions.addAll(listOf("16", "32", "64", "128", "256"))
             return suggestions.filter { it.startsWith(args[0]) }
         }
 
@@ -401,6 +415,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
 
     companion object {
         private const val PERMISSION_USE = "searchitems.command.search"
+        private const val PERMISSION_RELOAD = "searchitems.command.reload"
         private const val MAX_SHULKER_DEPTH = 8
         private val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")
     }
