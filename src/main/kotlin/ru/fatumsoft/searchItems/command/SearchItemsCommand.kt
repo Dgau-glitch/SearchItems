@@ -212,6 +212,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         var ticks = 0
         var scannedEligible = resumedState?.scannedEligible ?: 0
         var foundStorages = resumedState?.foundStorages ?: 0
+        val reusableHits = ArrayList<StorageHit>(16)
 
         activeTask = Bukkit.getScheduler().runTaskTimer(plugin, Runnable {
             repeat(chunkBatch) {
@@ -220,14 +221,19 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
                     return@Runnable
                 }
 
-                val localHits = ArrayList<StorageHit>(4)
-                val scanned = scanChunk(world, coordinate, targets, localHits, mode)
+                reusableHits.clear()
+                val scanned = scanChunk(world, coordinate, targets, reusableHits, mode)
                 if (scanned) {
                     scannedEligible++
                 }
-                if (localHits.isNotEmpty()) {
-                    foundStorages += localHits.size
-                    activeSession?.writer?.append(localHits.map(::formatEntry))
+                if (reusableHits.isNotEmpty()) {
+                    foundStorages += reusableHits.size
+                    val writer = activeSession?.writer
+                    if (writer != null) {
+                        for (hit in reusableHits) {
+                            writer.appendLine(formatEntry(hit))
+                        }
+                    }
                 }
                 activeSession?.scannedEligible = scannedEligible
                 activeSession?.foundStorages = foundStorages
@@ -374,6 +380,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             if (!isSupportedContainer(state)) continue
 
             val inventory = (state as org.bukkit.inventory.InventoryHolder).inventory
+            if (!mightContainTargets(inventory, targets)) continue
             val count = countMatchesInInventory(inventory, targets)
             if (count <= 0) continue
 
@@ -420,6 +427,16 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             total += countItemAndNested(item, targets, 0)
         }
         return total
+    }
+
+    private fun mightContainTargets(inventory: Inventory, targets: Set<Material>): Boolean {
+        val contents = inventory.contents
+        for (item in contents) {
+            if (item == null || item.type == Material.AIR) continue
+            if (item.type in targets) return true
+            if (item.type in SHULKER_BOX_TYPES) return true
+        }
+        return false
     }
 
     private fun countItemAndNested(item: ItemStack, targets: Set<Material>, depth: Int): Int {
@@ -602,6 +619,11 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             lines.forEach(queue::offer)
         }
 
+        fun appendLine(line: String) {
+            if (closed) return
+            queue.offer(line)
+        }
+
         fun close() {
             closed = true
             worker?.cancel()
@@ -630,6 +652,10 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         private const val MAX_SHULKER_DEPTH = 8
         private val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")
         private val MATERIAL_BY_NAME: Map<String, Material> = Material.entries.associateBy { it.name }
+        private val SHULKER_BOX_TYPES: Set<Material> = Material.entries
+            .asSequence()
+            .filter { it.name.endsWith("_SHULKER_BOX") }
+            .toSet()
     }
 
     private fun buildSignature(world: String, radius: Int, targets: Set<Material>, mode: ScanMode): String {
