@@ -7,7 +7,7 @@ authors: [ Dgau2 ]
 commands:
   searchitems:
     description: Поиск предметов в сундуках, бочках и шалкерах в радиусе
-    usage: /searchitems <радиус_блоков> <item1,item2,...>
+    usage: /searchitems <радиус_блоков> <item1,item2,...> [loaded|generated]
     permission: searchitems.command.search
 
 permissions:
