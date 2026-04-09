@@ -21,6 +21,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Properties
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
@@ -31,6 +32,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
     private val scanInProgress = AtomicBoolean(false)
     private var activeTask: BukkitTask? = null
     private var activeSession: ScanSession? = null
+    private val stateFile: Path by lazy { plugin.dataFolder.toPath().resolve("scan-state.properties") }
 
     override fun onCommand(
         sender: CommandSender,
@@ -56,7 +58,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
                 sender.sendMessage("§eАктивного сканирования нет.")
                 return true
             }
-            stopScan(sender, "§eСканирование остановлено вручную.")
+            stopScan(sender, "§eСканирование остановлено вручную.", persistProgress = true)
             return true
         }
 
@@ -162,7 +164,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
     }
 
     fun shutdown() {
-        stopScan(null, null)
+        stopScan(null, null, persistProgress = true)
     }
 
     private fun startScan(player: Player, radiusBlocks: Int, targets: Set<Material>, mode: ScanMode) {
@@ -175,26 +177,38 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
 
         val chunkBatch = plugin.config.getInt("search.chunks-per-tick", 6).coerceAtLeast(1)
         val progressEveryTicks = plugin.config.getInt("search.progress-message-every-ticks", 100).coerceAtLeast(20)
-        val iterator = SpiralChunkCursor(minChunkX, maxChunkX, minChunkZ, maxChunkZ)
+        val signature = buildSignature(world.name, radiusBlocks, targets, mode)
+        val resumedState = loadState(signature)
+        val iterator = if (resumedState != null) {
+            SpiralChunkCursor(minChunkX, maxChunkX, minChunkZ, maxChunkZ, resumedState.spiralState)
+        } else {
+            SpiralChunkCursor(minChunkX, maxChunkX, minChunkZ, maxChunkZ)
+        }
         val totalChunks = iterator.total
         val writer = StreamingReportWriter(plugin)
-        val reportPath = writer.start()
-        activeSession = ScanSession(writer, reportPath)
-
-        player.sendMessage(
-            "§7Запущено сканирование от центра мира (0,0) по спирали: $totalChunks чанков, режим: ${mode.configValue}..."
+        val reportPath = writer.start(resumedState?.reportPath)
+        activeSession = ScanSession(
+            writer = writer,
+            reportPath = reportPath,
+            signature = signature,
+            world = world.name,
+            radius = radiusBlocks,
+            mode = mode,
+            cursor = iterator,
+            scannedEligible = resumedState?.scannedEligible ?: 0,
+            foundStorages = resumedState?.foundStorages ?: 0
         )
 
+        notifyPlayer(player, "§7Запущено сканирование от центра мира (0,0) по спирали: $totalChunks чанков, режим: ${mode.configValue}...")
+        if (resumedState != null) {
+            notifyPlayer(player, "§eПродолжение с сохраненного прогресса: проверено ${resumedState.spiralState.processed}/${totalChunks}.")
+        }
+
         var ticks = 0
-        var scannedEligible = 0
-        var foundStorages = 0
+        var scannedEligible = resumedState?.scannedEligible ?: 0
+        var foundStorages = resumedState?.foundStorages ?: 0
 
         activeTask = Bukkit.getScheduler().runTaskTimer(plugin, Runnable {
-            if (!player.isOnline) {
-                finishScan(player, scannedEligible, foundStorages)
-                return@Runnable
-            }
-
             repeat(chunkBatch) {
                 val coordinate = iterator.next() ?: run {
                     finishScan(player, scannedEligible, foundStorages)
@@ -210,28 +224,33 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
                     foundStorages += localHits.size
                     activeSession?.writer?.append(localHits.map(::formatEntry))
                 }
+                activeSession?.scannedEligible = scannedEligible
+                activeSession?.foundStorages = foundStorages
             }
 
             ticks++
             if (ticks % progressEveryTicks == 0) {
-                player.sendMessage(
-                        "§7Прогресс: проверено ${iterator.processed}/${iterator.total} чанков; " +
-                        "подходящих: $scannedEligible; найдено хранилищ: $foundStorages"
-                )
+                notifyPlayer(player, "§7Прогресс: проверено ${iterator.processed}/${iterator.total} чанков; подходящих: $scannedEligible; найдено хранилищ: $foundStorages")
+                persistCurrentSessionState()
             }
         }, 1L, 1L)
     }
 
     private fun finishScan(player: Player, scannedEligible: Int, foundStorages: Int) {
         val reportPath = activeSession?.reportPath
-        stopScan(player, null)
-        player.sendMessage("§aГотово. Проверено подходящих чанков: $scannedEligible; найдено хранилищ: $foundStorages")
+        stopScan(player, null, persistProgress = false)
+        notifyPlayer(player, "§aГотово. Проверено подходящих чанков: $scannedEligible; найдено хранилищ: $foundStorages")
         if (reportPath != null) {
-            player.sendMessage("§aОтчёт: ${reportPath.toAbsolutePath()}")
+            notifyPlayer(player, "§aОтчёт: ${reportPath.toAbsolutePath()}")
         }
     }
 
-    private fun stopScan(sender: CommandSender?, message: String?) {
+    private fun stopScan(sender: CommandSender?, message: String?, persistProgress: Boolean) {
+        if (persistProgress) {
+            persistCurrentSessionState()
+        } else {
+            clearState()
+        }
         activeTask?.cancel()
         activeTask = null
         activeSession?.writer?.close()
@@ -240,6 +259,28 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         if (sender != null && message != null) {
             sender.sendMessage(message)
         }
+    }
+
+    private fun notifyPlayer(player: Player, message: String) {
+        if (player.isOnline) {
+            player.sendMessage(message)
+        } else {
+            plugin.logger.info("[SearchItems] ${player.name}: $message")
+        }
+    }
+
+    private fun persistCurrentSessionState() {
+        val session = activeSession ?: return
+        saveState(
+            signature = session.signature,
+            world = session.world,
+            radius = session.radius,
+            mode = session.mode,
+            reportPath = session.reportPath,
+            cursor = session.cursor,
+            scannedEligible = session.scannedEligible,
+            foundStorages = session.foundStorages
+        )
     }
 
     private fun scanChunk(
@@ -375,20 +416,32 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
 
     private data class ChunkCoordinate(val x: Int, val z: Int)
 
+    private data class SpiralState(
+        val currentX: Int,
+        val currentZ: Int,
+        val legLength: Int,
+        val legProgress: Int,
+        val legChanges: Int,
+        val directionIndex: Int,
+        val yielded: Long,
+        val processed: Long
+    )
+
     private class SpiralChunkCursor(
         private val minX: Int,
         private val maxX: Int,
         private val minZ: Int,
-        private val maxZ: Int
+        private val maxZ: Int,
+        state: SpiralState? = null
     ) {
-        private var currentX: Int = 0
-        private var currentZ: Int = 0
-        private var legLength: Int = 1
-        private var legProgress: Int = 0
-        private var legChanges: Int = 0
-        private var directionIndex: Int = 0
-        private var yielded: Long = 0
-        var processed: Long = 0
+        private var currentX: Int = state?.currentX ?: 0
+        private var currentZ: Int = state?.currentZ ?: 0
+        private var legLength: Int = state?.legLength ?: 1
+        private var legProgress: Int = state?.legProgress ?: 0
+        private var legChanges: Int = state?.legChanges ?: 0
+        private var directionIndex: Int = state?.directionIndex ?: 0
+        private var yielded: Long = state?.yielded ?: 0
+        var processed: Long = state?.processed ?: 0
             private set
 
         val total: Long = (maxX - minX + 1).toLong() * (maxZ - minZ + 1).toLong()
@@ -423,6 +476,19 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
                 }
             }
         }
+
+        fun snapshot(): SpiralState {
+            return SpiralState(
+                currentX = currentX,
+                currentZ = currentZ,
+                legLength = legLength,
+                legProgress = legProgress,
+                legChanges = legChanges,
+                directionIndex = directionIndex,
+                yielded = yielded,
+                processed = processed
+            )
+        }
     }
 
     private data class StorageHit(
@@ -438,7 +504,14 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
 
     private data class ScanSession(
         val writer: StreamingReportWriter,
-        val reportPath: Path
+        val reportPath: Path,
+        val signature: String,
+        val world: String,
+        val radius: Int,
+        val mode: ScanMode,
+        val cursor: SpiralChunkCursor,
+        var scannedEligible: Int,
+        var foundStorages: Int
     )
 
     private class StreamingReportWriter(private val plugin: JavaPlugin) {
@@ -448,15 +521,16 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         private var worker: BukkitTask? = null
         private lateinit var path: Path
 
-        fun start(): Path {
+        fun start(existingPath: Path?): Path {
             if (!plugin.dataFolder.exists()) {
                 plugin.dataFolder.mkdirs()
             }
-            val fileName = "search-result-${LocalDateTime.now().format(TIME_FORMATTER)}.txt"
-            path = plugin.dataFolder.toPath().resolve(fileName)
-            Files.newBufferedWriter(path).use { writer ->
-                writer.write("# SearchItems streaming report")
-                writer.newLine()
+            path = existingPath ?: plugin.dataFolder.toPath().resolve("search-result-${LocalDateTime.now().format(TIME_FORMATTER)}.txt")
+            if (existingPath == null || !Files.exists(path)) {
+                Files.newBufferedWriter(path).use { writer ->
+                    writer.write("# SearchItems streaming report")
+                    writer.newLine()
+                }
             }
 
             worker = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, Runnable {
@@ -500,6 +574,81 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         private val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")
         private val MATERIAL_BY_NAME: Map<String, Material> = Material.entries.associateBy { it.name }
     }
+
+    private fun buildSignature(world: String, radius: Int, targets: Set<Material>, mode: ScanMode): String {
+        val joined = targets.map { it.name }.sorted().joinToString(",")
+        return "$world|$radius|${mode.configValue}|$joined"
+    }
+
+    private fun saveState(
+        signature: String,
+        world: String,
+        radius: Int,
+        mode: ScanMode,
+        reportPath: Path,
+        cursor: SpiralChunkCursor,
+        scannedEligible: Int,
+        foundStorages: Int
+    ) {
+        if (!plugin.dataFolder.exists()) plugin.dataFolder.mkdirs()
+        val s = cursor.snapshot()
+        val props = Properties().apply {
+            setProperty("signature", signature)
+            setProperty("world", world)
+            setProperty("radius", radius.toString())
+            setProperty("mode", mode.configValue)
+            setProperty("reportPath", reportPath.toString())
+            setProperty("scannedEligible", scannedEligible.toString())
+            setProperty("foundStorages", foundStorages.toString())
+            setProperty("currentX", s.currentX.toString())
+            setProperty("currentZ", s.currentZ.toString())
+            setProperty("legLength", s.legLength.toString())
+            setProperty("legProgress", s.legProgress.toString())
+            setProperty("legChanges", s.legChanges.toString())
+            setProperty("directionIndex", s.directionIndex.toString())
+            setProperty("yielded", s.yielded.toString())
+            setProperty("processed", s.processed.toString())
+        }
+        Files.newOutputStream(stateFile).use { props.store(it, "SearchItems scan state") }
+    }
+
+    private fun loadState(signature: String): PersistedState? {
+        if (!Files.exists(stateFile)) return null
+        return runCatching {
+            val props = Properties()
+            Files.newInputStream(stateFile).use { props.load(it) }
+            if (props.getProperty("signature") != signature) return null
+            val spiral = SpiralState(
+                currentX = props.getProperty("currentX").toInt(),
+                currentZ = props.getProperty("currentZ").toInt(),
+                legLength = props.getProperty("legLength").toInt(),
+                legProgress = props.getProperty("legProgress").toInt(),
+                legChanges = props.getProperty("legChanges").toInt(),
+                directionIndex = props.getProperty("directionIndex").toInt(),
+                yielded = props.getProperty("yielded").toLong(),
+                processed = props.getProperty("processed").toLong()
+            )
+            PersistedState(
+                reportPath = Path.of(props.getProperty("reportPath")),
+                scannedEligible = props.getProperty("scannedEligible").toInt(),
+                foundStorages = props.getProperty("foundStorages").toInt(),
+                spiralState = spiral
+            )
+        }.getOrNull()
+    }
+
+    private fun clearState() {
+        if (Files.exists(stateFile)) {
+            Files.delete(stateFile)
+        }
+    }
+
+    private data class PersistedState(
+        val reportPath: Path,
+        val scannedEligible: Int,
+        val foundStorages: Int,
+        val spiralState: SpiralState
+    )
 
     private enum class ScanMode(val configValue: String) {
         GENERATED("generated"),
