@@ -357,7 +357,10 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             .asSequence()
             .map { it.trim() }
             .filter { it.isNotEmpty() }
-            .mapNotNull { Material.matchMaterial(it, true) }
+            .mapNotNull { token ->
+                val normalized = token.uppercase(Locale.ROOT).removePrefix("MINECRAFT:")
+                MATERIAL_BY_NAME[normalized]
+            }
             .toCollection(LinkedHashSet())
     }
 
@@ -495,6 +498,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         private const val PERMISSION_STOP = "searchitems.command.stop"
         private const val MAX_SHULKER_DEPTH = 8
         private val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")
+        private val MATERIAL_BY_NAME: Map<String, Material> = Material.entries.associateBy { it.name }
     }
 
     private enum class ScanMode(val configValue: String) {
