@@ -21,6 +21,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.floor
@@ -29,6 +30,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
 
     private val scanInProgress = AtomicBoolean(false)
     private var activeTask: BukkitTask? = null
+    private var activeSession: ScanSession? = null
 
     override fun onCommand(
         sender: CommandSender,
@@ -43,6 +45,18 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             }
             plugin.reloadConfig()
             sender.sendMessage("§aКонфиг SearchItems успешно перезагружен.")
+            return true
+        }
+        if (args.size == 1 && args[0].equals("stop", ignoreCase = true)) {
+            if (!sender.hasPermission(PERMISSION_STOP)) {
+                sender.sendMessage("§cУ вас нет прав для остановки сканирования.")
+                return true
+            }
+            if (!scanInProgress.get()) {
+                sender.sendMessage("§eАктивного сканирования нет.")
+                return true
+            }
+            stopScan(sender, "§eСканирование остановлено вручную.")
             return true
         }
 
@@ -100,12 +114,18 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         alias: String,
         args: Array<out String>
     ): List<String> {
-        if (!sender.hasPermission(PERMISSION_USE) && !sender.hasPermission(PERMISSION_RELOAD)) return emptyList()
+        if (!sender.hasPermission(PERMISSION_USE) &&
+            !sender.hasPermission(PERMISSION_RELOAD) &&
+            !sender.hasPermission(PERMISSION_STOP)
+        ) return emptyList()
 
         if (args.size == 1) {
             val suggestions = ArrayList<String>(6)
             if (sender.hasPermission(PERMISSION_RELOAD)) {
                 suggestions.add("reload")
+            }
+            if (sender.hasPermission(PERMISSION_STOP)) {
+                suggestions.add("stop")
             }
             suggestions.addAll(listOf("16", "32", "64", "128", "256"))
             return suggestions.filter { it.startsWith(args[0]) }
@@ -142,80 +162,84 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
     }
 
     fun shutdown() {
-        activeTask?.cancel()
-        activeTask = null
-        scanInProgress.set(false)
+        stopScan(null, null)
     }
 
     private fun startScan(player: Player, radiusBlocks: Int, targets: Set<Material>, mode: ScanMode) {
-        val location = player.location
-        val world = location.world
-        if (world == null) {
-            scanInProgress.set(false)
-            player.sendMessage("§cНе удалось определить мир игрока.")
-            return
-        }
+        val world = player.world
 
-        val minChunkX = floor((location.x - radiusBlocks) / 16.0).toInt()
-        val maxChunkX = floor((location.x + radiusBlocks) / 16.0).toInt()
-        val minChunkZ = floor((location.z - radiusBlocks) / 16.0).toInt()
-        val maxChunkZ = floor((location.z + radiusBlocks) / 16.0).toInt()
+        val minChunkX = floor((-radiusBlocks) / 16.0).toInt()
+        val maxChunkX = floor((radiusBlocks) / 16.0).toInt()
+        val minChunkZ = floor((-radiusBlocks) / 16.0).toInt()
+        val maxChunkZ = floor((radiusBlocks) / 16.0).toInt()
 
         val chunkBatch = plugin.config.getInt("search.chunks-per-tick", 6).coerceAtLeast(1)
         val progressEveryTicks = plugin.config.getInt("search.progress-message-every-ticks", 100).coerceAtLeast(20)
-        val storages = ArrayList<StorageHit>()
-        val iterator = ChunkRangeCursor(minChunkX, maxChunkX, minChunkZ, maxChunkZ)
+        val iterator = SpiralChunkCursor(minChunkX, maxChunkX, minChunkZ, maxChunkZ)
         val totalChunks = iterator.total
+        val writer = StreamingReportWriter(plugin)
+        val reportPath = writer.start()
+        activeSession = ScanSession(writer, reportPath)
 
         player.sendMessage(
-            "§7Запущено сканирование диапазона: $totalChunks чанков, режим: ${mode.configValue}..."
+            "§7Запущено сканирование от центра мира (0,0) по спирали: $totalChunks чанков, режим: ${mode.configValue}..."
         )
 
         var ticks = 0
         var scannedEligible = 0
+        var foundStorages = 0
 
         activeTask = Bukkit.getScheduler().runTaskTimer(plugin, Runnable {
             if (!player.isOnline) {
-                finishScan(player, storages)
+                finishScan(player, scannedEligible, foundStorages)
                 return@Runnable
             }
 
             repeat(chunkBatch) {
                 val coordinate = iterator.next() ?: run {
-                    finishScan(player, storages)
+                    finishScan(player, scannedEligible, foundStorages)
                     return@Runnable
                 }
 
-                val scanned = scanChunk(world, coordinate, targets, storages, mode)
+                val localHits = ArrayList<StorageHit>(4)
+                val scanned = scanChunk(world, coordinate, targets, localHits, mode)
                 if (scanned) {
                     scannedEligible++
+                }
+                if (localHits.isNotEmpty()) {
+                    foundStorages += localHits.size
+                    activeSession?.writer?.append(localHits.map(::formatEntry))
                 }
             }
 
             ticks++
             if (ticks % progressEveryTicks == 0) {
                 player.sendMessage(
-                    "§7Прогресс: проверено ${iterator.processed}/${iterator.total} чанков; " +
-                        "подходящих: $scannedEligible; найдено хранилищ: ${storages.size}"
+                        "§7Прогресс: проверено ${iterator.processed}/${iterator.total} чанков; " +
+                        "подходящих: $scannedEligible; найдено хранилищ: $foundStorages"
                 )
             }
         }, 1L, 1L)
     }
 
-    private fun finishScan(player: Player, storages: MutableList<StorageHit>) {
+    private fun finishScan(player: Player, scannedEligible: Int, foundStorages: Int) {
+        val reportPath = activeSession?.reportPath
+        stopScan(player, null)
+        player.sendMessage("§aГотово. Проверено подходящих чанков: $scannedEligible; найдено хранилищ: $foundStorages")
+        if (reportPath != null) {
+            player.sendMessage("§aОтчёт: ${reportPath.toAbsolutePath()}")
+        }
+    }
+
+    private fun stopScan(sender: CommandSender?, message: String?) {
         activeTask?.cancel()
         activeTask = null
-
-        storages.sortByDescending { it.chunkWeight }
-
-        Bukkit.getScheduler().runTaskAsynchronously(plugin, Runnable {
-            val file = writeReport(storages)
-            Bukkit.getScheduler().runTask(plugin, Runnable {
-                scanInProgress.set(false)
-                player.sendMessage("§aГотово. Найдено хранилищ: ${storages.size}")
-                player.sendMessage("§aОтчёт: ${file.toAbsolutePath()}")
-            })
-        })
+        activeSession?.writer?.close()
+        activeSession = null
+        scanInProgress.set(false)
+        if (sender != null && message != null) {
+            sender.sendMessage(message)
+        }
     }
 
     private fun scanChunk(
@@ -323,30 +347,6 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         return state is Chest || state is Barrel || state is ShulkerBox
     }
 
-    private fun writeReport(storages: List<StorageHit>): Path {
-        if (!plugin.dataFolder.exists()) {
-            plugin.dataFolder.mkdirs()
-        }
-
-        val fileName = "search-result-${LocalDateTime.now().format(TIME_FORMATTER)}.txt"
-        val filePath = plugin.dataFolder.toPath().resolve(fileName)
-
-        Files.newBufferedWriter(filePath).use { writer ->
-            writer.write("# SearchItems report")
-            writer.newLine()
-            writer.write("# Entries: ${storages.size}")
-            writer.newLine()
-            writer.newLine()
-
-            for (entry in storages) {
-                writer.write(formatEntry(entry))
-                writer.newLine()
-            }
-        }
-
-        return filePath
-    }
-
     private fun formatEntry(entry: StorageHit): String {
         val tp = "/minecraft:tp ${entry.x} ${entry.y} ${entry.z}"
         return "chunkWeight=${entry.chunkWeight}; items=${entry.itemCount}; world=${entry.world}; chunk=${entry.chunkX},${entry.chunkZ}; pos=${entry.x},${entry.y},${entry.z}; tp=${tp}"
@@ -372,33 +372,53 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
 
     private data class ChunkCoordinate(val x: Int, val z: Int)
 
-    private class ChunkRangeCursor(
+    private class SpiralChunkCursor(
         private val minX: Int,
         private val maxX: Int,
         private val minZ: Int,
         private val maxZ: Int
     ) {
-        private var currentX: Int = minX
-        private var currentZ: Int = minZ
+        private var currentX: Int = 0
+        private var currentZ: Int = 0
+        private var legLength: Int = 1
+        private var legProgress: Int = 0
+        private var legChanges: Int = 0
+        private var directionIndex: Int = 0
+        private var yielded: Long = 0
         var processed: Long = 0
             private set
 
         val total: Long = (maxX - minX + 1).toLong() * (maxZ - minZ + 1).toLong()
 
         fun next(): ChunkCoordinate? {
-            if (currentX > maxX) return null
-
-            val result = ChunkCoordinate(currentX, currentZ)
-            processed++
-
-            if (currentZ >= maxZ) {
-                currentZ = minZ
-                currentX++
-            } else {
-                currentZ++
+            while (yielded < total) {
+                val result = ChunkCoordinate(currentX, currentZ)
+                advanceSpiral()
+                if (result.x in minX..maxX && result.z in minZ..maxZ) {
+                    processed++
+                    yielded++
+                    return result
+                }
             }
+            return null
+        }
 
-            return result
+        private fun advanceSpiral() {
+            when (directionIndex) {
+                0 -> currentX++
+                1 -> currentZ++
+                2 -> currentX--
+                else -> currentZ--
+            }
+            legProgress++
+            if (legProgress >= legLength) {
+                legProgress = 0
+                directionIndex = (directionIndex + 1) % 4
+                legChanges++
+                if (legChanges % 2 == 0) {
+                    legLength++
+                }
+            }
         }
     }
 
@@ -413,9 +433,66 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         var chunkWeight: Int
     )
 
+    private data class ScanSession(
+        val writer: StreamingReportWriter,
+        val reportPath: Path
+    )
+
+    private class StreamingReportWriter(private val plugin: JavaPlugin) {
+        private val queue = LinkedBlockingQueue<String>()
+        @Volatile
+        private var closed = false
+        private var worker: BukkitTask? = null
+        private lateinit var path: Path
+
+        fun start(): Path {
+            if (!plugin.dataFolder.exists()) {
+                plugin.dataFolder.mkdirs()
+            }
+            val fileName = "search-result-${LocalDateTime.now().format(TIME_FORMATTER)}.txt"
+            path = plugin.dataFolder.toPath().resolve(fileName)
+            Files.newBufferedWriter(path).use { writer ->
+                writer.write("# SearchItems streaming report")
+                writer.newLine()
+            }
+
+            worker = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, Runnable {
+                flushBatch(500)
+            }, 1L, 1L)
+
+            return path
+        }
+
+        fun append(lines: List<String>) {
+            if (closed) return
+            lines.forEach(queue::offer)
+        }
+
+        fun close() {
+            closed = true
+            worker?.cancel()
+            worker = null
+            flushBatch(Int.MAX_VALUE)
+        }
+
+        private fun flushBatch(limit: Int) {
+            if (!::path.isInitialized) return
+            var processed = 0
+            Files.newBufferedWriter(path, java.nio.file.StandardOpenOption.APPEND).use { writer ->
+                while (processed < limit) {
+                    val line = queue.poll() ?: break
+                    writer.write(line)
+                    writer.newLine()
+                    processed++
+                }
+            }
+        }
+    }
+
     companion object {
         private const val PERMISSION_USE = "searchitems.command.search"
         private const val PERMISSION_RELOAD = "searchitems.command.reload"
+        private const val PERMISSION_STOP = "searchitems.command.stop"
         private const val MAX_SHULKER_DEPTH = 8
         private val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")
     }
