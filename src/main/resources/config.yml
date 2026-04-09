@@ -1,4 +1,5 @@
 search:
-  max-radius-blocks: 512
-  chunks-per-tick: 6
+  max-radius-blocks: 10000
+  chunks-per-tick: 2
+  progress-message-every-ticks: 100
   default-scan-mode: generated

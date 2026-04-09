@@ -57,7 +57,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             return true
         }
 
-        val maxRadius = plugin.config.getInt("search.max-radius-blocks", 512)
+        val maxRadius = plugin.config.getInt("search.max-radius-blocks", 10_000)
         if (radiusBlocks > maxRadius) {
             sender.sendMessage("§cМаксимальный радиус: $maxRadius блоков.")
             return true
@@ -147,33 +147,18 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         val minChunkZ = floor((location.z - radiusBlocks) / 16.0).toInt()
         val maxChunkZ = floor((location.z + radiusBlocks) / 16.0).toInt()
 
-        val chunksToScan = ArrayList<ChunkCoordinate>((maxChunkX - minChunkX + 1) * (maxChunkZ - minChunkZ + 1))
-        for (cx in minChunkX..maxChunkX) {
-            for (cz in minChunkZ..maxChunkZ) {
-                when (mode) {
-                    ScanMode.LOADED -> if (world.isChunkLoaded(cx, cz)) {
-                        chunksToScan.add(ChunkCoordinate(cx, cz))
-                    }
-                    ScanMode.GENERATED -> if (world.isChunkGenerated(cx, cz)) {
-                        chunksToScan.add(ChunkCoordinate(cx, cz))
-                    }
-                }
-            }
-        }
-
-        if (chunksToScan.isEmpty()) {
-            scanInProgress.set(false)
-            player.sendMessage("§eВ указанном радиусе нет загруженных чанков для проверки.")
-            return
-        }
-
         val chunkBatch = plugin.config.getInt("search.chunks-per-tick", 6).coerceAtLeast(1)
+        val progressEveryTicks = plugin.config.getInt("search.progress-message-every-ticks", 100).coerceAtLeast(20)
         val storages = ArrayList<StorageHit>()
-        var index = 0
+        val iterator = ChunkRangeCursor(minChunkX, maxChunkX, minChunkZ, maxChunkZ)
+        val totalChunks = iterator.total
 
         player.sendMessage(
-            "§7Запущено сканирование: ${chunksToScan.size} чанков, режим: ${mode.configValue}..."
+            "§7Запущено сканирование диапазона: $totalChunks чанков, режим: ${mode.configValue}..."
         )
+
+        var ticks = 0
+        var scannedEligible = 0
 
         activeTask = Bukkit.getScheduler().runTaskTimer(plugin, Runnable {
             if (!player.isOnline) {
@@ -182,13 +167,23 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             }
 
             repeat(chunkBatch) {
-                if (index >= chunksToScan.size) {
+                val coordinate = iterator.next() ?: run {
                     finishScan(player, storages)
                     return@Runnable
                 }
 
-                val coordinate = chunksToScan[index++]
-                scanChunk(world, coordinate, targets, storages, mode)
+                val scanned = scanChunk(world, coordinate, targets, storages, mode)
+                if (scanned) {
+                    scannedEligible++
+                }
+            }
+
+            ticks++
+            if (ticks % progressEveryTicks == 0) {
+                player.sendMessage(
+                    "§7Прогресс: проверено ${iterator.processed}/${iterator.total} чанков; " +
+                        "подходящих: $scannedEligible; найдено хранилищ: ${storages.size}"
+                )
             }
         }, 1L, 1L)
     }
@@ -215,22 +210,25 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         targets: Set<Material>,
         out: MutableList<StorageHit>,
         mode: ScanMode
-    ) {
+    ): Boolean {
         if (mode == ScanMode.GENERATED && !world.isChunkGenerated(coordinate.x, coordinate.z)) {
-            return
+            return false
+        }
+        if (mode == ScanMode.LOADED && !world.isChunkLoaded(coordinate.x, coordinate.z)) {
+            return false
         }
 
         val wasLoaded = world.isChunkLoaded(coordinate.x, coordinate.z)
         val chunk = when {
             wasLoaded -> world.getChunkAt(coordinate.x, coordinate.z)
             mode == ScanMode.GENERATED -> world.getChunkAt(coordinate.x, coordinate.z, false)
-            else -> return
+            else -> return false
         }
 
         val tileEntities = chunk.tileEntities
         if (tileEntities.isEmpty()) {
             unloadIfNeeded(world, coordinate, wasLoaded, mode)
-            return
+            return true
         }
 
         val localHits = ArrayList<StorageHit>(4)
@@ -258,12 +256,13 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
 
         if (localHits.isEmpty()) {
             unloadIfNeeded(world, coordinate, wasLoaded, mode)
-            return
+            return true
         }
 
         localHits.forEach { it.chunkWeight = chunkWeight }
         out.addAll(localHits)
         unloadIfNeeded(world, coordinate, wasLoaded, mode)
+        return true
     }
 
     private fun unloadIfNeeded(
@@ -358,6 +357,36 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
     }
 
     private data class ChunkCoordinate(val x: Int, val z: Int)
+
+    private class ChunkRangeCursor(
+        private val minX: Int,
+        private val maxX: Int,
+        private val minZ: Int,
+        private val maxZ: Int
+    ) {
+        private var currentX: Int = minX
+        private var currentZ: Int = minZ
+        var processed: Long = 0
+            private set
+
+        val total: Long = (maxX - minX + 1).toLong() * (maxZ - minZ + 1).toLong()
+
+        fun next(): ChunkCoordinate? {
+            if (currentX > maxX) return null
+
+            val result = ChunkCoordinate(currentX, currentZ)
+            processed++
+
+            if (currentZ >= maxZ) {
+                currentZ = minZ
+                currentX++
+            } else {
+                currentZ++
+            }
+
+            return result
+        }
+    }
 
     private data class StorageHit(
         val world: String,
