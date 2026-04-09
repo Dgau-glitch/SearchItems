@@ -77,8 +77,8 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             return true
         }
 
-        if (args.size < 2) {
-            sender.sendMessage("§eИспользование: /$label <радиус_блоков> <item1,item2,...> [loaded|generated]")
+        if (args.isEmpty()) {
+            sender.sendMessage("§eИспользование: /$label <радиус_блоков> [loaded|generated]")
             return true
         }
 
@@ -94,13 +94,13 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             return true
         }
 
-        val targets = parseMaterials(args[1])
-        if (targets.isEmpty()) {
-            sender.sendMessage("§cНе найдено валидных материалов в списке: ${args[1]}")
+        val weightedTargets = loadWeightedTargets()
+        if (weightedTargets == null) {
+            sender.sendMessage("§cВ config.yml не настроены валидные search.target-items с весами от 0 до 1.")
             return true
         }
 
-        val mode = parseScanMode(args.getOrNull(2), plugin.config.getString("search.default-scan-mode", "generated"))
+        val mode = parseScanMode(args.getOrNull(1), plugin.config.getString("search.default-scan-mode", "generated"))
         if (mode == null) {
             sender.sendMessage("§cРежим сканирования должен быть loaded или generated.")
             return true
@@ -111,7 +111,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             return true
         }
 
-        startScan(sender, radiusBlocks, targets, mode)
+        startScan(sender, radiusBlocks, weightedTargets, mode)
         return true
     }
 
@@ -139,30 +139,8 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         }
 
         if (args.size == 2) {
-            val input = args[1].uppercase(Locale.ROOT)
-            val parts = input.split(',')
-            val prefix = parts.lastOrNull().orEmpty()
-            val selected = parts.dropLast(1).toHashSet()
-
-            val basePrefix = if (parts.size > 1) {
-                parts.dropLast(1).joinToString(",") + ","
-            } else {
-                ""
-            }
-
-            return Material.entries
-                .asSequence()
-                .map { it.name }
-                .filter { it !in selected }
-                .filter { it.startsWith(prefix) }
-                .take(50)
-                .map { basePrefix + it }
-                .toList()
-        }
-
-        if (args.size == 3) {
             val modes = listOf("generated", "loaded")
-            return modes.filter { it.startsWith(args[2].lowercase(Locale.ROOT)) }
+            return modes.filter { it.startsWith(args[1].lowercase(Locale.ROOT)) }
         }
 
         return emptyList()
@@ -172,7 +150,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         stopScan(null, null, persistProgress = true)
     }
 
-    private fun startScan(player: Player, radiusBlocks: Int, targets: Set<Material>, mode: ScanMode) {
+    private fun startScan(player: Player, radiusBlocks: Int, targets: WeightedTargets, mode: ScanMode) {
         val world = player.world
 
         val minChunkX = floor((-radiusBlocks) / 16.0).toInt()
@@ -338,18 +316,18 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         Files.move(tempPath, reportPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
     }
 
-    private fun extractChunkWeight(line: String): Int {
+    private fun extractChunkWeight(line: String): Double {
         val prefix = "chunkWeight="
-        if (!line.startsWith(prefix)) return 0
+        if (!line.startsWith(prefix)) return 0.0
         val end = line.indexOf(';')
-        if (end <= prefix.length) return 0
-        return line.substring(prefix.length, end).toIntOrNull() ?: 0
+        if (end <= prefix.length) return 0.0
+        return line.substring(prefix.length, end).toDoubleOrNull() ?: 0.0
     }
 
     private fun scanChunk(
         world: World,
         coordinate: ChunkCoordinate,
-        targets: Set<Material>,
+        targets: WeightedTargets,
         out: MutableList<StorageHit>,
         mode: ScanMode
     ): Boolean {
@@ -374,26 +352,26 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         }
 
         val localHits = ArrayList<StorageHit>(4)
-        var chunkWeight = 0
+        var chunkWeight = 0.0
 
         for (state in tileEntities) {
             if (!isSupportedContainer(state)) continue
 
             val inventory = (state as org.bukkit.inventory.InventoryHolder).inventory
-            if (!mightContainTargets(inventory, targets)) continue
-            val count = countMatchesInInventory(inventory, targets)
-            if (count <= 0) continue
+            if (!mightContainTargets(inventory, targets.materials)) continue
+            val match = countMatchesInInventory(inventory, targets)
+            if (match.amount <= 0) continue
 
-            chunkWeight += count
+            chunkWeight += match.weighted
             localHits.add(StorageHit(
                 world = chunk.world.name,
                 x = state.x,
                 y = state.y,
                 z = state.z,
-                itemCount = count,
+                itemCount = match.amount,
                 chunkX = chunk.x,
                 chunkZ = chunk.z,
-                chunkWeight = 0
+                chunkWeight = 0.0
             ))
         }
 
@@ -419,14 +397,17 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         }
     }
 
-    private fun countMatchesInInventory(inventory: Inventory, targets: Set<Material>): Int {
-        var total = 0
+    private fun countMatchesInInventory(inventory: Inventory, targets: WeightedTargets): MatchResult {
+        var amount = 0
+        var weighted = 0.0
         val contents = inventory.contents
         for (item in contents) {
             if (item == null || item.type == Material.AIR) continue
-            total += countItemAndNested(item, targets, 0)
+            val nested = countItemAndNested(item, targets, 0)
+            amount += nested.amount
+            weighted += nested.weighted
         }
-        return total
+        return MatchResult(amount, weighted)
     }
 
     private fun mightContainTargets(inventory: Inventory, targets: Set<Material>): Boolean {
@@ -439,9 +420,16 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         return false
     }
 
-    private fun countItemAndNested(item: ItemStack, targets: Set<Material>, depth: Int): Int {
-        var sum = if (item.type in targets) item.amount else 0
-        if (depth >= MAX_SHULKER_DEPTH) return sum
+    private fun countItemAndNested(item: ItemStack, targets: WeightedTargets, depth: Int): MatchResult {
+        var amount = 0
+        var weighted = 0.0
+
+        val weight = targets.weights[item.type]
+        if (weight != null) {
+            amount += item.amount
+            weighted += item.amount * weight
+        }
+        if (depth >= MAX_SHULKER_DEPTH) return MatchResult(amount, weighted)
 
         val meta = item.itemMeta
         if (meta is BlockStateMeta && meta.hasBlockState()) {
@@ -450,12 +438,14 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
                 val nested = blockState.inventory.contents
                 for (nestedItem in nested) {
                     if (nestedItem == null || nestedItem.type == Material.AIR) continue
-                    sum += countItemAndNested(nestedItem, targets, depth + 1)
+                    val nestedMatch = countItemAndNested(nestedItem, targets, depth + 1)
+                    amount += nestedMatch.amount
+                    weighted += nestedMatch.weighted
                 }
             }
         }
 
-        return sum
+        return MatchResult(amount, weighted)
     }
 
     private fun isSupportedContainer(state: BlockState): Boolean {
@@ -464,19 +454,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
 
     private fun formatEntry(entry: StorageHit): String {
         val tp = "/minecraft:tp ${entry.x} ${entry.y} ${entry.z}"
-        return "chunkWeight=${entry.chunkWeight}; items=${entry.itemCount}; world=${entry.world}; chunk=${entry.chunkX},${entry.chunkZ}; pos=${entry.x},${entry.y},${entry.z}; tp=${tp}"
-    }
-
-    private fun parseMaterials(raw: String): Set<Material> {
-        return raw.split(',')
-            .asSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .mapNotNull { token ->
-                val normalized = token.uppercase(Locale.ROOT).removePrefix("MINECRAFT:")
-                MATERIAL_BY_NAME[normalized]
-            }
-            .toCollection(LinkedHashSet())
+        return "chunkWeight=${"%.4f".format(Locale.US, entry.chunkWeight)}; items=${entry.itemCount}; world=${entry.world}; chunk=${entry.chunkX},${entry.chunkZ}; pos=${entry.x},${entry.y},${entry.z}; tp=${tp}"
     }
 
     private fun parseScanMode(rawArg: String?, configValue: String?): ScanMode? {
@@ -573,8 +551,19 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         val itemCount: Int,
         val chunkX: Int,
         val chunkZ: Int,
-        var chunkWeight: Int
+        var chunkWeight: Double
     )
+
+    private data class MatchResult(
+        val amount: Int,
+        val weighted: Double
+    )
+
+    private data class WeightedTargets(
+        val weights: Map<Material, Double>
+    ) {
+        val materials: Set<Material> = weights.keys
+    }
 
     private data class ScanSession(
         val writer: StreamingReportWriter,
@@ -658,9 +647,24 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             .toSet()
     }
 
-    private fun buildSignature(world: String, radius: Int, targets: Set<Material>, mode: ScanMode): String {
-        val joined = targets.map { it.name }.sorted().joinToString(",")
+    private fun buildSignature(world: String, radius: Int, targets: WeightedTargets, mode: ScanMode): String {
+        val joined = targets.weights.entries
+            .sortedBy { it.key.name }
+            .joinToString(",") { "${it.key.name}:${"%.4f".format(Locale.US, it.value)}" }
         return "$world|$radius|${mode.configValue}|$joined"
+    }
+
+    private fun loadWeightedTargets(): WeightedTargets? {
+        val section = plugin.config.getConfigurationSection("search.target-items") ?: return null
+        val weights = LinkedHashMap<Material, Double>()
+        for (rawKey in section.getKeys(false)) {
+            val material = MATERIAL_BY_NAME[rawKey.uppercase(Locale.ROOT)] ?: continue
+            val value = section.getDouble(rawKey, -1.0)
+            if (value < 0.0 || value > 1.0) continue
+            weights[material] = value
+        }
+        if (weights.isEmpty()) return null
+        return WeightedTargets(weights)
     }
 
     private fun saveState(
