@@ -1,0 +1,5 @@
+name: SearchItems
+version: '1.0-SNAPSHOT'
+main: ru.fatumsoft.searchItems.SearchItems
+api-version: '1.21'
+authors: [ Dgau2 ]
