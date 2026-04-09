@@ -371,7 +371,8 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
                 itemCount = match.amount,
                 chunkX = chunk.x,
                 chunkZ = chunk.z,
-                chunkWeight = 0.0
+                chunkWeight = 0.0,
+                matchedItems = match.matchedItems
             ))
         }
 
@@ -400,14 +401,18 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
     private fun countMatchesInInventory(inventory: Inventory, targets: WeightedTargets): MatchResult {
         var amount = 0
         var weighted = 0.0
+        val matched = HashMap<Material, Int>(8)
         val contents = inventory.contents
         for (item in contents) {
             if (item == null || item.type == Material.AIR) continue
-            val nested = countItemAndNested(item, targets, 0)
+            val nested = countItemAndNested(item, targets, 0, matched)
             amount += nested.amount
             weighted += nested.weighted
         }
-        return MatchResult(amount, weighted)
+        val matchedCsv = matched.entries
+            .sortedBy { it.key.name }
+            .joinToString(",") { "${it.key.name}x${it.value}" }
+        return MatchResult(amount, weighted, matchedCsv)
     }
 
     private fun mightContainTargets(inventory: Inventory, targets: Set<Material>): Boolean {
@@ -420,7 +425,12 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         return false
     }
 
-    private fun countItemAndNested(item: ItemStack, targets: WeightedTargets, depth: Int): MatchResult {
+    private fun countItemAndNested(
+        item: ItemStack,
+        targets: WeightedTargets,
+        depth: Int,
+        matched: MutableMap<Material, Int>
+    ): MatchResult {
         var amount = 0
         var weighted = 0.0
 
@@ -428,8 +438,9 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         if (weight != null) {
             amount += item.amount
             weighted += item.amount * weight
+            matched[item.type] = (matched[item.type] ?: 0) + item.amount
         }
-        if (depth >= MAX_SHULKER_DEPTH) return MatchResult(amount, weighted)
+        if (depth >= MAX_SHULKER_DEPTH) return MatchResult(amount, weighted, "")
 
         val meta = item.itemMeta
         if (meta is BlockStateMeta && meta.hasBlockState()) {
@@ -438,14 +449,14 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
                 val nested = blockState.inventory.contents
                 for (nestedItem in nested) {
                     if (nestedItem == null || nestedItem.type == Material.AIR) continue
-                    val nestedMatch = countItemAndNested(nestedItem, targets, depth + 1)
+                    val nestedMatch = countItemAndNested(nestedItem, targets, depth + 1, matched)
                     amount += nestedMatch.amount
                     weighted += nestedMatch.weighted
                 }
             }
         }
 
-        return MatchResult(amount, weighted)
+        return MatchResult(amount, weighted, "")
     }
 
     private fun isSupportedContainer(state: BlockState): Boolean {
@@ -454,7 +465,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
 
     private fun formatEntry(entry: StorageHit): String {
         val tp = "/minecraft:tp ${entry.x} ${entry.y} ${entry.z}"
-        return "chunkWeight=${"%.4f".format(Locale.US, entry.chunkWeight)}; items=${entry.itemCount}; world=${entry.world}; chunk=${entry.chunkX},${entry.chunkZ}; pos=${entry.x},${entry.y},${entry.z}; tp=${tp}"
+        return "chunkWeight=${"%.4f".format(Locale.US, entry.chunkWeight)}; items=${entry.itemCount}; matched=${entry.matchedItems}; world=${entry.world}; chunk=${entry.chunkX},${entry.chunkZ}; pos=${entry.x},${entry.y},${entry.z}; tp=${tp}"
     }
 
     private fun parseScanMode(rawArg: String?, configValue: String?): ScanMode? {
@@ -551,12 +562,14 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         val itemCount: Int,
         val chunkX: Int,
         val chunkZ: Int,
-        var chunkWeight: Double
+        var chunkWeight: Double,
+        val matchedItems: String
     )
 
     private data class MatchResult(
         val amount: Int,
-        val weighted: Double
+        val weighted: Double,
+        val matchedItems: String
     )
 
     private data class WeightedTargets(
