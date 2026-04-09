@@ -58,7 +58,12 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
                 sender.sendMessage("§eАктивного сканирования нет.")
                 return true
             }
-            stopScan(sender, "§eСканирование остановлено вручную.", persistProgress = true)
+            val reportPath = stopScan(sender, "§eСканирование остановлено вручную.", persistProgress = true)
+            if (reportPath != null) {
+                sortReportAsync(reportPath) { sortedPath ->
+                    sender.sendMessage("§aОтчёт отсортирован по chunkWeight: ${sortedPath.toAbsolutePath()}")
+                }
+            }
             return true
         }
 
@@ -237,15 +242,17 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
     }
 
     private fun finishScan(player: Player, scannedEligible: Int, foundStorages: Int) {
-        val reportPath = activeSession?.reportPath
-        stopScan(player, null, persistProgress = false)
+        val reportPath = stopScan(player, null, persistProgress = false)
         notifyPlayer(player, "§aГотово. Проверено подходящих чанков: $scannedEligible; найдено хранилищ: $foundStorages")
         if (reportPath != null) {
-            notifyPlayer(player, "§aОтчёт: ${reportPath.toAbsolutePath()}")
+            sortReportAsync(reportPath) { sortedPath ->
+                notifyPlayer(player, "§aОтчёт (отсортирован по chunkWeight): ${sortedPath.toAbsolutePath()}")
+            }
         }
     }
 
-    private fun stopScan(sender: CommandSender?, message: String?, persistProgress: Boolean) {
+    private fun stopScan(sender: CommandSender?, message: String?, persistProgress: Boolean): Path? {
+        val reportPath = activeSession?.reportPath
         if (persistProgress) {
             persistCurrentSessionState()
         } else {
@@ -259,6 +266,7 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
         if (sender != null && message != null) {
             sender.sendMessage(message)
         }
+        return reportPath
     }
 
     private fun notifyPlayer(player: Player, message: String) {
@@ -281,6 +289,55 @@ class SearchItemsCommand(private val plugin: JavaPlugin) : CommandExecutor, TabC
             scannedEligible = session.scannedEligible,
             foundStorages = session.foundStorages
         )
+    }
+
+    private fun sortReportAsync(reportPath: Path, onDone: (Path) -> Unit) {
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, Runnable {
+            sortReportByChunkWeight(reportPath)
+            Bukkit.getScheduler().runTask(plugin, Runnable {
+                onDone(reportPath)
+            })
+        })
+    }
+
+    private fun sortReportByChunkWeight(reportPath: Path) {
+        if (!Files.exists(reportPath)) return
+        val lines = Files.readAllLines(reportPath)
+        if (lines.isEmpty()) return
+
+        val headers = ArrayList<String>()
+        val entries = ArrayList<String>()
+        for (line in lines) {
+            if (line.startsWith("#") || line.isBlank()) {
+                headers.add(line)
+            } else {
+                entries.add(line)
+            }
+        }
+
+        entries.sortByDescending { extractChunkWeight(it) }
+
+        val tempPath = reportPath.resolveSibling("${reportPath.fileName}.tmp")
+        Files.newBufferedWriter(tempPath).use { writer ->
+            headers.forEach {
+                writer.write(it)
+                writer.newLine()
+            }
+            entries.forEach {
+                writer.write(it)
+                writer.newLine()
+            }
+        }
+
+        Files.move(tempPath, reportPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    }
+
+    private fun extractChunkWeight(line: String): Int {
+        val prefix = "chunkWeight="
+        if (!line.startsWith(prefix)) return 0
+        val end = line.indexOf(';')
+        if (end <= prefix.length) return 0
+        return line.substring(prefix.length, end).toIntOrNull() ?: 0
     }
 
     private fun scanChunk(
