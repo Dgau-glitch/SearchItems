@@ -1,5 +1,16 @@
 name: SearchItems
-version: '1.0-SNAPSHOT'
+version: '${version}'
 main: ru.fatumsoft.searchItems.SearchItems
 api-version: '1.21'
 authors: [ Dgau2 ]
+
+commands:
+  searchitems:
+    description: Поиск предметов в сундуках, бочках и шалкерах в радиусе
+    usage: /searchitems <радиус_блоков> <item1,item2,...>
+    permission: searchitems.command.search
+
+permissions:
+  searchitems.command.search:
+    description: Доступ к команде поиска предметов
+    default: op

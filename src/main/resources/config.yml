@@ -1,0 +1,3 @@
+search:
+  max-radius-blocks: 512
+  chunks-per-tick: 6
