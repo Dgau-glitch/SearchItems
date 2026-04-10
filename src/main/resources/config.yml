@@ -1,0 +1,12 @@
+search:
+  max-radius-blocks: 10000
+  chunks-per-tick: 2
+  progress-message-every-ticks: 100
+  default-scan-mode: generated
+  target-items:
+    ELYTRA: 1.0
+    NETHERITE_BLOCK: 1.0
+    NETHERITE_INGOT: 0.9
+    NETHERITE_SCRAP: 0.7
+    DIAMOND_BLOCK: 0.8
+    DIAMOND: 0.5

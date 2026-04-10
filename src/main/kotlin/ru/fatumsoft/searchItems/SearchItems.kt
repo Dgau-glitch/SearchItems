@@ -1,14 +1,25 @@
 package ru.fatumsoft.searchItems
 
 import org.bukkit.plugin.java.JavaPlugin
+import ru.fatumsoft.searchItems.command.SearchItemsCommand
 
 class SearchItems : JavaPlugin() {
 
+    private lateinit var searchCommand: SearchItemsCommand
+
     override fun onEnable() {
-        // Plugin startup logic
+        saveDefaultConfig()
+
+        searchCommand = SearchItemsCommand(this)
+        getCommand("searchitems")?.apply {
+            setExecutor(searchCommand)
+            tabCompleter = searchCommand
+        }
     }
 
     override fun onDisable() {
-        // Plugin shutdown logic
+        if (this::searchCommand.isInitialized) {
+            searchCommand.shutdown()
+        }
     }
 }

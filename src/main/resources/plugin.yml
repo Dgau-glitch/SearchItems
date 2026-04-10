@@ -1,5 +1,21 @@
 name: SearchItems
-version: '1.0-SNAPSHOT'
+version: '${version}'
 main: ru.fatumsoft.searchItems.SearchItems
 api-version: '1.21'
 authors: [ Dgau2 ]
+
+commands:
+  searchitems:
+    description: Поиск предметов в хранилищах и перезагрузка конфига
+    usage: /searchitems reload | /searchitems stop | /searchitems <радиус_блоков> [loaded|generated]
+
+permissions:
+  searchitems.command.search:
+    description: Доступ к команде поиска предметов
+    default: op
+  searchitems.command.reload:
+    description: Доступ к перезагрузке конфига SearchItems
+    default: op
+  searchitems.command.stop:
+    description: Доступ к остановке активного сканирования SearchItems
+    default: op
